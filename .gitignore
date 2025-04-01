@@ -1,8 +1,18 @@
 # Ignore data files
 data/credentials.txt
 data/apkwan/class_pw.txt
+activate.bat
+setup_ffmpeg.py
+data/perplexity_api_key
+database.py
+data/videos/
+data/results/
+tools/
+models/
+playground.ipynb
 
 # Ignore virtual environment
 venv/
 __pycache__/
 *.pyc 
+.venv/
