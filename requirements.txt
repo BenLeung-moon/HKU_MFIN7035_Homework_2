@@ -2,7 +2,10 @@ pytubefix>=4.0.0
 SpeechRecognition>=3.10.0
 pydub>=0.25.1
 faster-whisper>=0.10.0
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
 tenacity>=8.2.0
 requests>=2.31.0
 yfinance>=0.2.36

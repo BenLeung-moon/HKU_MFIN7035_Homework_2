@@ -14,7 +14,6 @@ import time
 import yfinance as yf
 import requests
 
-# Configuration
 CHANNEL_URL = "https://www.youtube.com/c/TradeBrigade"  # TradeBrigade's channel
 BACKTEST_START_DATE = "2023-03-31"
 BACKTEST_END_DATE = "2024-03-31"

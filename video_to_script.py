@@ -12,6 +12,7 @@ from urllib.parse import urlparse, parse_qs
 from tenacity import retry, stop_after_attempt, wait_exponential
 from faster_whisper import WhisperModel
 import torch
+import platform
 
 class VideoToScript:
     def __init__(self, output_dir="data/videos"):
@@ -22,19 +23,23 @@ class VideoToScript:
         # Check for ffmpeg installation
         self._check_ffmpeg()
         
-        # Check for CUDA availability and optimize settings
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Check for GPU availability and optimize settings
+        self.device = "cuda" if torch.cuda.is_available() else "mps" if self._is_mac_with_metal() else "cpu"
+        
         if self.device == "cuda":
             # Get GPU information
             gpu_name = torch.cuda.get_device_name(0)
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
-            print(f"Using GPU: {gpu_name} with {gpu_memory:.1f}GB memory")
+            print(f"Using CUDA GPU: {gpu_name} with {gpu_memory:.1f}GB memory")
             
             # Optimize compute type based on GPU memory
             if gpu_memory >= 16:  # High-end GPU
                 self.compute_type = "float16"
             else:  # Mid-range GPU
                 self.compute_type = "int8_float16"
+        elif self.device == "mps":
+            print("Using Apple Metal GPU acceleration")
+            self.compute_type = "float16"  # Metal works best with float16
         else:
             self.compute_type = "int8"
             print("No GPU available, using CPU")
@@ -49,8 +54,8 @@ class VideoToScript:
             device=self.device,
             compute_type=self.compute_type,
             download_root="models",  # Save models to a local directory
-            num_workers=4 if self.device == "cuda" else 2,  # More workers for GPU
-            cpu_threads=6 if self.device == "cuda" else 4  # More CPU threads for GPU
+            num_workers=4 if self.device in ["cuda", "mps"] else 2,  # More workers for GPU
+            cpu_threads=6 if self.device in ["cuda", "mps"] else 4  # More CPU threads for GPU
         )
         print("Whisper model loaded successfully")
     
@@ -64,6 +69,16 @@ class VideoToScript:
             print("Please run setup_ffmpeg.py to install ffmpeg")
             print("Or install ffmpeg manually and add it to your system PATH")
             raise RuntimeError("ffmpeg is required but not installed")
+    
+    def _is_mac_with_metal(self):
+        """Check if running on Mac with Metal GPU support"""
+        if platform.system() != "Darwin":  # Not macOS
+            return False
+        try:
+            # Check if MPS (Metal Performance Shaders) is available
+            return torch.backends.mps.is_available() and torch.backends.mps.is_built()
+        except:
+            return False
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def _create_youtube_object(self, url):
@@ -395,7 +410,7 @@ class VideoToScript:
             print(f"Transcribing audio with Whisper: {audio_path}")
             
             # Optimize transcription parameters based on device
-            if self.device == "cuda":
+            if self.device in ["cuda", "mps"]:
                 segments, _ = self.model.transcribe(
                     audio_path,
                     beam_size=5,
