@@ -18,7 +18,7 @@ import requests
 CHANNEL_URL = "https://www.youtube.com/c/TradeBrigade"  # TradeBrigade's channel
 BACKTEST_START_DATE = "2023-03-31"
 BACKTEST_END_DATE = "2024-03-31"
-MAX_VIDEOS = 1  # One year of weekly videos
+MAX_VIDEOS = 10  # One year of weekly videos
 TEST_MODE = False  # Set to False for full evaluation
 
 def get_perplexity_api_key():
@@ -74,7 +74,7 @@ def analyze_transcript_with_llm(transcript, video_title, video_date):
             "https://api.perplexity.ai/chat/completions",
             headers=headers,
             json={
-                "model": "pplx-7b-online",  # Using the online model for real-time analysis
+                "model": "sonar-reasoning",  # Using the online model for real-time analysis
                 "messages": [
                     {"role": "system", "content": "You are a financial analyst assistant that extracts predictions from stock market commentary."},
                     {"role": "user", "content": prompt}
@@ -133,23 +133,39 @@ def get_spy_performance(prediction_date, timeframe="short-term"):
     start_date_str = prediction_date.strftime("%Y-%m-%d")
     end_date_str = end_date.strftime("%Y-%m-%d")
     
-    try:
-        # Get SPY data using yfinance
-        spy_data = yf.download("SPY", start=start_date_str, end=end_date_str)
-        
-        if spy_data.empty:
-            print(f"No SPY data available for {start_date_str} to {end_date_str}")
-            return np.random.normal(0.01, 0.05)  # Fallback to random if no data
-        
-        # Calculate performance (percent change from start to end)
-        start_price = spy_data['Close'].iloc[0]
-        end_price = spy_data['Close'].iloc[-1]
-        performance = (end_price - start_price) / start_price
-        
-        return performance
-    except Exception as e:
-        print(f"Error fetching SPY data: {e}")
-        return np.random.normal(0.01, 0.05)  # Fallback to random if error
+    max_retries = 3
+    retry_delay = 5  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Get SPY data using yfinance with increased timeout
+            spy_data = yf.download(
+                "SPY", 
+                start=start_date_str, 
+                end=end_date_str,
+                timeout=30  # Increase timeout to 30 seconds
+            )
+            
+            if spy_data.empty:
+                print(f"No SPY data available for {start_date_str} to {end_date_str}")
+                return np.random.normal(0.01, 0.05)  # Fallback to random if no data
+            
+            # Calculate performance (percent change from start to end)
+            start_price = spy_data['Close'].iloc[0]
+            end_price = spy_data['Close'].iloc[-1]
+            performance = (end_price - start_price) / start_price
+            
+            return performance
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                print(f"All attempts failed to fetch SPY data: {str(e)}")
+                return np.random.normal(0.01, 0.05)  # Fallback to random if all attempts fail
 
 def main():
     # Create output directory
@@ -206,7 +222,7 @@ def main():
                     "video_date": video_date,
                     "prediction": analysis["prediction"],
                     "timeframe": analysis["timeframe"],
-                    "actual_performance": performance,
+                    "actual_performance": float(performance),  # Convert numpy float to Python float
                     "is_correct": is_correct,
                     "conditions": analysis["conditions"],
                     "justifications": analysis["justifications"],
@@ -216,7 +232,7 @@ def main():
                 
                 # Add to results
                 result["analysis"] = analysis
-                result["performance"] = performance
+                result["performance"] = float(performance)  # Convert numpy float to Python float
                 result["is_correct"] = is_correct
                 results.append(result)
                 
@@ -230,7 +246,19 @@ def main():
         if results:
             # Save detailed results
             output_file = "data/results/tradebrigade_analysis.json"
-            converter.save_results(results, output_file)
+            # Convert any pandas Series to lists or dictionaries before saving
+            serializable_results = []
+            for result in results:
+                serializable_result = {}
+                for key, value in result.items():
+                    if isinstance(value, pd.Series):
+                        serializable_result[key] = value.to_dict()
+                    else:
+                        serializable_result[key] = value
+                serializable_results.append(serializable_result)
+            
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(serializable_results, f, indent=2, ensure_ascii=False)
             print(f"\nDetailed results saved to {output_file}")
             
             # Save evaluation summary
