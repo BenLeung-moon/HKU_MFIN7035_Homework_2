@@ -13,6 +13,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from faster_whisper import WhisperModel
 import torch
 import platform
+import multiprocessing
 
 class VideoToScript:
     def __init__(self, output_dir="data/videos"):
@@ -23,6 +24,10 @@ class VideoToScript:
         # Check for ffmpeg installation
         self._check_ffmpeg()
         
+        # Get number of CPU cores for fallback
+        self.num_cores = multiprocessing.cpu_count()
+        print(f"Number of CPU cores available: {self.num_cores}")
+        
         # Check for GPU availability and optimize settings
         self.device = "cuda" if torch.cuda.is_available() else "mps" if self._is_mac_with_metal() else "cpu"
         
@@ -32,30 +37,35 @@ class VideoToScript:
             gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
             print(f"Using CUDA GPU: {gpu_name} with {gpu_memory:.1f}GB memory")
             
-            # Optimize compute type based on GPU memory
+            # Optimize compute type and model size based on GPU memory
             if gpu_memory >= 16:  # High-end GPU
                 self.compute_type = "float16"
+                self.model_size = "large"  # Use larger model for high-end GPUs
             else:  # Mid-range GPU
                 self.compute_type = "int8_float16"
+                self.model_size = "medium"  # Use medium model for mid-range GPUs
         elif self.device == "mps":
             print("Using Apple Metal GPU acceleration")
             self.compute_type = "float16"  # Metal works best with float16
+            self.model_size = "medium"  # Use medium model for Metal GPU
         else:
             self.compute_type = "int8"
-            print("No GPU available, using CPU")
+            self.model_size = "base"  # Use base model for CPU
+            print("Using CPU for transcription")
         
         print(f"Using device: {self.device}")
         print(f"Compute type: {self.compute_type}")
+        print(f"Model size: {self.model_size}")
         
         # Initialize whisper model with optimized settings
         print("Loading Whisper model...")
         self.model = WhisperModel(
-            "base",  # You can use "tiny", "base", "small", "medium", or "large"
+            self.model_size,  # Use model size based on device
             device=self.device,
             compute_type=self.compute_type,
             download_root="models",  # Save models to a local directory
-            num_workers=4 if self.device in ["cuda", "mps"] else 2,  # More workers for GPU
-            cpu_threads=6 if self.device in ["cuda", "mps"] else 4  # More CPU threads for GPU
+            num_workers=1 if self.device == "cuda" else self.num_cores,  # Use 1 worker for GPU, all cores for CPU
+            cpu_threads=1 if self.device == "cuda" else self.num_cores  # Use 1 thread for GPU, all cores for CPU
         )
         print("Whisper model loaded successfully")
     
@@ -427,7 +437,9 @@ class VideoToScript:
                     audio_path,
                     beam_size=3,  # Reduced for CPU
                     vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500)
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    language="en",
+                    initial_prompt="This is a financial market analysis video."
                 )
             
             text = " ".join([segment.text for segment in segments])
