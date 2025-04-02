@@ -13,12 +13,15 @@ from video_to_script import VideoToScript
 import time
 import yfinance as yf
 import requests
+import shutil
 
 CHANNEL_URL = "https://www.youtube.com/c/TradeBrigade"  # TradeBrigade's channel
-BACKTEST_START_DATE = "2023-03-31"
-BACKTEST_END_DATE = "2024-03-31"
-MAX_VIDEOS = 10  # One year of weekly videos
-TEST_MODE = False  # Set to False for full evaluation
+BACKTEST_START_DATE = "2023-03-31"  # Start date for backtesting
+BACKTEST_END_DATE = "2024-03-31"    # End date for backtesting
+TEST_MODE = True  # Set to True for testing with fewer videos
+MAX_VIDEOS = 2 if TEST_MODE else 10  # Number of videos to analyze
+USE_PREDOWNLOADED_VIDEOS = False  # Set to True to use pre-downloaded videos for testing
+VIDEOS_DIR = "data/videos"  # Directory containing pre-downloaded videos
 
 def get_perplexity_api_key():
     """Get Perplexity API key from file or user input"""
@@ -75,15 +78,19 @@ def analyze_transcript_with_llm(transcript, video_title, video_date):
             json={
                 "model": "sonar-reasoning",  # Using the online model for real-time analysis
                 "messages": [
-                    {"role": "system", "content": "You are a financial analyst assistant that extracts predictions from stock market commentary."},
+                    {"role": "system", "content": "You are a financial analyst assistant that extracts predictions from stock market commentary. Be specific and accurate in your analysis."},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.4
+                "temperature": 0.2  # Lower temperature for more consistent results
             }
         )
         
         if response.status_code == 200:
             analysis = json.loads(response.json()["choices"][0]["message"]["content"])
+            # Validate prediction format
+            valid_predictions = ["bullish", "bearish", "neutral", "conditional"]
+            if analysis["prediction"] not in valid_predictions:
+                analysis["prediction"] = "unknown"
             return analysis
         else:
             print(f"Perplexity API error: {response.text}")
@@ -176,14 +183,49 @@ def main():
     # Process TradeBrigade videos
     print(f"Processing videos from TradeBrigade channel: {CHANNEL_URL}")
     try:
-        # Download videos from channel
-        video_paths = converter.download_from_channel(CHANNEL_URL, limit=MAX_VIDEOS)
+        video_paths = []
         
-        if not video_paths:
-            print("Failed to download any videos from channel")
-            return
+        if USE_PREDOWNLOADED_VIDEOS:
+            # Use pre-downloaded videos
+            if not os.path.exists(VIDEOS_DIR):
+                print(f"Error: Pre-downloaded videos directory not found: {VIDEOS_DIR}")
+                return
+                
+            # Get list of video files
+            video_files = [f for f in os.listdir(VIDEOS_DIR) if f.endswith('.mp4')]
+            if not video_files:
+                print(f"No pre-downloaded videos found in {VIDEOS_DIR}")
+                return
+                
+            # Sort videos by date (assuming filename contains date)
+            video_files.sort(reverse=True)  # Newest first
             
-        print(f"\nSuccessfully downloaded {len(video_paths)} videos")
+            # Limit number of videos
+            video_files = video_files[:MAX_VIDEOS]
+            
+            # Create full paths
+            video_paths = [os.path.join(VIDEOS_DIR, f) for f in video_files]
+            print(f"\nUsing {len(video_paths)} pre-downloaded videos")
+            
+        else:
+            # Delete existing videos if any
+            if os.path.exists(VIDEOS_DIR):
+                print("Cleaning up existing videos...")
+                shutil.rmtree(VIDEOS_DIR)
+                os.makedirs(VIDEOS_DIR)
+            
+            # Download videos from channel
+            video_paths = converter.download_from_channel(
+                CHANNEL_URL, 
+                limit=MAX_VIDEOS,
+                backtest_end_date=BACKTEST_END_DATE
+            )
+            
+            if not video_paths:
+                print("Failed to download any videos from channel")
+                return
+                
+            print(f"\nSuccessfully downloaded {len(video_paths)} videos")
         
         # Process each video
         results = []
@@ -203,8 +245,14 @@ def main():
                     print(f"Warning: No script generated for video {i}")
                     continue
                 
-                # Extract video date from filename or use current date
-                video_date = datetime.datetime.strptime(BACKTEST_START_DATE, "%Y-%m-%d").strftime("%Y-%m-%d")
+                # Get video date from YouTube
+                video = converter._create_youtube_object(f"https://www.youtube.com/watch?v={converter._extract_video_id(video_path)}")
+                video_date = video.publish_date.strftime("%Y-%m-%d")
+                
+                # Skip videos from the future
+                if video_date > BACKTEST_END_DATE:
+                    print(f"Skipping future video from {video_date}")
+                    continue
                 
                 # Analyze transcript
                 analysis = analyze_transcript_with_llm(result["script"], result["video_name"], video_date)
@@ -233,6 +281,7 @@ def main():
                 result["analysis"] = analysis
                 result["performance"] = float(performance)  # Convert numpy float to Python float
                 result["is_correct"] = is_correct
+                result["video_date"] = video_date  # Add video date to result
                 results.append(result)
                 
                 print(f"Successfully processed video {i}")

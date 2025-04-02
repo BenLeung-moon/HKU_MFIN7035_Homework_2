@@ -14,6 +14,7 @@ from faster_whisper import WhisperModel
 import torch
 import platform
 import multiprocessing
+import datetime
 
 class VideoToScript:
     def __init__(self, output_dir="data/videos"):
@@ -94,10 +95,77 @@ class VideoToScript:
     def _create_youtube_object(self, url):
         """Create YouTube object with retry mechanism"""
         try:
-            return YouTube(url)
+            # Create YouTube object without headers
+            return YouTube(url, use_oauth=False, allow_oauth_cache=True)
         except Exception as e:
             print(f"Error creating YouTube object: {e}")
+            # Try to extract video ID from filename if URL creation fails
+            try:
+                video_id = self._extract_video_id_from_filename(url)
+                if video_id:
+                    return YouTube(f"https://www.youtube.com/watch?v={video_id}", 
+                                 use_oauth=False, 
+                                 allow_oauth_cache=True)
+            except Exception as e2:
+                print(f"Error creating YouTube object from filename: {e2}")
             raise
+
+    def _extract_video_id_from_filename(self, filename):
+        """Extract video ID from filename if it contains one"""
+        try:
+            # Common patterns for video IDs in filenames
+            patterns = [
+                r'\[([a-zA-Z0-9_-]{11})\]',  # [VIDEO_ID]
+                r'\(([a-zA-Z0-9_-]{11})\)',  # (VIDEO_ID)
+                r'([a-zA-Z0-9_-]{11})\.mp4$'  # VIDEO_ID.mp4
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, filename)
+                if match:
+                    return match.group(1)
+            return None
+        except Exception as e:
+            print(f"Error extracting video ID from filename: {e}")
+            return None
+
+    def _get_video_date_from_filename(self, filename):
+        """Extract date from filename if it contains one
+        
+        Args:
+            filename (str): Name of the video file
+            
+        Returns:
+            str: Date in YYYY-MM-DD format or None if not found
+        """
+        try:
+            # First try the new format: YYYY-MM-DD_Title.mp4
+            date_match = re.match(r'^(\d{4}-\d{2}-\d{2})_', filename)
+            if date_match:
+                return date_match.group(1)
+            
+            # Try other common date patterns in filenames
+            patterns = [
+                r'(\d{4}-\d{2}-\d{2})',  # YYYY-MM-DD
+                r'(\d{2}-\d{2}-\d{4})',  # MM-DD-YYYY
+                r'(\d{4}\d{2}\d{2})'     # YYYYMMDD
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, filename)
+                if match:
+                    date_str = match.group(1)
+                    # Convert to standard format YYYY-MM-DD
+                    if len(date_str) == 8:  # YYYYMMDD
+                        return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+                    elif len(date_str.split('-')[0]) == 2:  # MM-DD-YYYY
+                        parts = date_str.split('-')
+                        return f"{parts[2]}-{parts[0]}-{parts[1]}"
+                    return date_str  # Already YYYY-MM-DD
+            return None
+        except Exception as e:
+            print(f"Error extracting date from filename: {e}")
+            return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def _download_stream(self, stream, output_path):
@@ -109,12 +177,13 @@ class VideoToScript:
             print(f"Error downloading stream: {e}")
             raise
     
-    def download_from_channel(self, channel_url, limit=5):
+    def download_from_channel(self, channel_url, limit=5, backtest_end_date=None):
         """Download videos from a YouTube channel
         
         Args:
             channel_url (str): URL of the YouTube channel
             limit (int): Maximum number of videos to download
+            backtest_end_date (str): Only download videos after this date (YYYY-MM-DD)
             
         Returns:
             list: List of downloaded video paths
@@ -128,14 +197,27 @@ class VideoToScript:
                 print(f"Error creating Channel object: {e}")
                 return []
             
+            # Convert backtest_end_date to datetime if provided
+            if backtest_end_date:
+                backtest_end_date = datetime.datetime.strptime(backtest_end_date, "%Y-%m-%d")
+            
+            # Get all videos and sort by publish date
+            videos = list(channel.videos)
+            videos.sort(key=lambda x: x.publish_date, reverse=True)  # Sort by date, newest first
+            
             video_paths = []
             count = 0
             
-            for video in channel.videos:
+            for video in videos:
                 if count >= limit:
                     break
                 
-                print(f"Downloading: {video.title}")
+                # Skip videos before backtest_end_date
+                if backtest_end_date and video.publish_date < backtest_end_date:
+                    print(f"Skipping video from {video.publish_date.strftime('%Y-%m-%d')} (before backtest end date)")
+                    continue
+                
+                print(f"Downloading: {video.title} (Published: {video.publish_date.strftime('%Y-%m-%d')})")
                 video_path = self._download_video(video)
                 if video_path:
                     video_paths.append(video_path)
@@ -240,13 +322,19 @@ class VideoToScript:
                 print("No suitable stream found")
                 return None
             
-            # Create a safe filename using only alphanumeric characters and underscores
-            safe_filename = re.sub(r'[^a-zA-Z0-9]', '_', video.title)
-            safe_filename = re.sub(r'_+', '_', safe_filename)  # Replace multiple underscores with single
-            safe_filename = safe_filename.strip('_')  # Remove leading/trailing underscores
-            safe_filename = safe_filename[:100]  # Limit filename length
+            # Get video date
+            video_date = video.publish_date.strftime("%Y-%m-%d")
             
-            output_path = os.path.join(self.output_dir, f"{safe_filename}.mp4")
+            # Create a safe filename using only alphanumeric characters and underscores
+            safe_title = re.sub(r'[^a-zA-Z0-9]', '_', video.title)
+            safe_title = re.sub(r'_+', '_', safe_title)  # Replace multiple underscores with single
+            safe_title = safe_title.strip('_')  # Remove leading/trailing underscores
+            safe_title = safe_title[:50]  # Limit title length to leave room for date
+            
+            # Create filename with date: YYYY-MM-DD_Title.mp4
+            safe_filename = f"{video_date}_{safe_title}.mp4"
+            
+            output_path = os.path.join(self.output_dir, safe_filename)
             
             # Download the video with retry mechanism
             try:
@@ -462,6 +550,9 @@ class VideoToScript:
             video_filename = os.path.basename(video_path)
             video_name = os.path.splitext(video_filename)[0]
             
+            # Try to get video date from filename first
+            video_date = self._get_video_date_from_filename(video_filename)
+            
             # Convert video to audio
             audio_path = self._extract_audio(video_path)
             
@@ -477,7 +568,8 @@ class VideoToScript:
                 "video_name": video_name,
                 "video_path": video_path,
                 "script": script,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "video_date": video_date  # Add video date if found
             }
             
             return result
