@@ -1,20 +1,17 @@
 # This script is used to download youtube video and convert a video to a script
 import os
 import json
-from pytubefix import YouTube, Channel
 import speech_recognition as sr
 from pydub import AudioSegment
 import tempfile
-import requests
 import time
 import re
-from urllib.parse import urlparse, parse_qs
 from tenacity import retry, stop_after_attempt, wait_exponential
 from faster_whisper import WhisperModel
 import torch
 import platform
 import multiprocessing
-import datetime
+import subprocess
 
 class VideoToScript:
     def __init__(self, output_dir="data/videos"):
@@ -45,10 +42,32 @@ class VideoToScript:
             else:  # Mid-range GPU
                 self.compute_type = "int8_float16"
                 self.model_size = "medium"  # Use medium model for mid-range GPUs
+            
+            # Verify CUDA is working
+            try:
+                test_tensor = torch.zeros(1).cuda()
+                print("CUDA initialization successful")
+            except Exception as e:
+                print(f"CUDA initialization failed: {e}")
+                print("Falling back to CPU")
+                self.device = "cpu"
+                self.compute_type = "int8"
+                self.model_size = "base"
         elif self.device == "mps":
             print("Using Apple Metal GPU acceleration")
             self.compute_type = "float16"  # Metal works best with float16
             self.model_size = "medium"  # Use medium model for Metal GPU
+            
+            # Verify MPS is working
+            try:
+                test_tensor = torch.zeros(1).to("mps")
+                print("MPS initialization successful")
+            except Exception as e:
+                print(f"MPS initialization failed: {e}")
+                print("Falling back to CPU")
+                self.device = "cpu"
+                self.compute_type = "int8"
+                self.model_size = "base"
         else:
             self.compute_type = "int8"
             self.model_size = "base"  # Use base model for CPU
@@ -60,15 +79,30 @@ class VideoToScript:
         
         # Initialize whisper model with optimized settings
         print("Loading Whisper model...")
-        self.model = WhisperModel(
-            self.model_size,  # Use model size based on device
-            device=self.device,
-            compute_type=self.compute_type,
-            download_root="models",  # Save models to a local directory
-            num_workers=1 if self.device == "cuda" else self.num_cores,  # Use 1 worker for GPU, all cores for CPU
-            cpu_threads=1 if self.device == "cuda" else self.num_cores  # Use 1 thread for GPU, all cores for CPU
-        )
-        print("Whisper model loaded successfully")
+        try:
+            self.model = WhisperModel(
+                self.model_size,  # Use model size based on device
+                device=self.device,
+                compute_type=self.compute_type,
+                download_root="models",  # Save models to a local directory
+                num_workers=1 if self.device in ["cuda", "mps"] else self.num_cores,  # Use 1 worker for GPU, all cores for CPU
+                cpu_threads=1 if self.device in ["cuda", "mps"] else self.num_cores  # Use 1 thread for GPU, all cores for CPU
+            )
+            print("Whisper model loaded successfully")
+        except Exception as e:
+            print(f"Error loading Whisper model: {e}")
+            print("Falling back to CPU with base model")
+            self.device = "cpu"
+            self.compute_type = "int8"
+            self.model_size = "base"
+            self.model = WhisperModel(
+                "base",
+                device="cpu",
+                compute_type="int8",
+                download_root="models",
+                num_workers=self.num_cores,
+                cpu_threads=self.num_cores
+            )
     
     def _check_ffmpeg(self):
         """Check if ffmpeg is installed and accessible"""
@@ -90,310 +124,6 @@ class VideoToScript:
             return torch.backends.mps.is_available() and torch.backends.mps.is_built()
         except:
             return False
-    
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def _create_youtube_object(self, url):
-        """Create YouTube object with retry mechanism"""
-        try:
-            # Create YouTube object without headers
-            return YouTube(url, use_oauth=False, allow_oauth_cache=True)
-        except Exception as e:
-            print(f"Error creating YouTube object: {e}")
-            # Try to extract video ID from filename if URL creation fails
-            try:
-                video_id = self._extract_video_id_from_filename(url)
-                if video_id:
-                    return YouTube(f"https://www.youtube.com/watch?v={video_id}", 
-                                 use_oauth=False, 
-                                 allow_oauth_cache=True)
-            except Exception as e2:
-                print(f"Error creating YouTube object from filename: {e2}")
-            raise
-
-    def _extract_video_id_from_filename(self, filename):
-        """Extract video ID from filename if it contains one"""
-        try:
-            # Common patterns for video IDs in filenames
-            patterns = [
-                r'\[([a-zA-Z0-9_-]{11})\]',  # [VIDEO_ID]
-                r'\(([a-zA-Z0-9_-]{11})\)',  # (VIDEO_ID)
-                r'([a-zA-Z0-9_-]{11})\.mp4$'  # VIDEO_ID.mp4
-            ]
-            
-            for pattern in patterns:
-                match = re.search(pattern, filename)
-                if match:
-                    return match.group(1)
-            return None
-        except Exception as e:
-            print(f"Error extracting video ID from filename: {e}")
-            return None
-
-    def _get_video_date_from_filename(self, filename):
-        """Extract date from filename if it contains one
-        
-        Args:
-            filename (str): Name of the video file
-            
-        Returns:
-            str: Date in YYYY-MM-DD format or None if not found
-        """
-        try:
-            # First try the new format: YYYY-MM-DD_Title.mp4
-            date_match = re.match(r'^(\d{4}-\d{2}-\d{2})_', filename)
-            if date_match:
-                return date_match.group(1)
-            
-            # Try other common date patterns in filenames
-            patterns = [
-                r'(\d{4}-\d{2}-\d{2})',  # YYYY-MM-DD
-                r'(\d{2}-\d{2}-\d{4})',  # MM-DD-YYYY
-                r'(\d{4}\d{2}\d{2})'     # YYYYMMDD
-            ]
-            
-            for pattern in patterns:
-                match = re.search(pattern, filename)
-                if match:
-                    date_str = match.group(1)
-                    # Convert to standard format YYYY-MM-DD
-                    if len(date_str) == 8:  # YYYYMMDD
-                        return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-                    elif len(date_str.split('-')[0]) == 2:  # MM-DD-YYYY
-                        parts = date_str.split('-')
-                        return f"{parts[2]}-{parts[0]}-{parts[1]}"
-                    return date_str  # Already YYYY-MM-DD
-            return None
-        except Exception as e:
-            print(f"Error extracting date from filename: {e}")
-            return None
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    def _download_stream(self, stream, output_path):
-        """Download stream with retry mechanism"""
-        try:
-            stream.download(output_path=os.path.dirname(output_path), filename=os.path.basename(output_path))
-            return output_path
-        except Exception as e:
-            print(f"Error downloading stream: {e}")
-            raise
-    
-    def download_from_channel(self, channel_url, limit=5, backtest_end_date=None):
-        """Download videos from a YouTube channel
-        
-        Args:
-            channel_url (str): URL of the YouTube channel
-            limit (int): Maximum number of videos to download
-            backtest_end_date (str): Only download videos after this date (YYYY-MM-DD)
-            
-        Returns:
-            list: List of downloaded video paths
-        """
-        try:
-            print(f"Processing channel: {channel_url}")
-            try:
-                channel = Channel(channel_url)
-                print(f"Channel name: {channel.channel_name}")
-            except Exception as e:
-                print(f"Error creating Channel object: {e}")
-                return []
-            
-            # Convert backtest_end_date to datetime if provided
-            if backtest_end_date:
-                backtest_end_date = datetime.datetime.strptime(backtest_end_date, "%Y-%m-%d")
-            
-            # Get all videos and sort by publish date
-            videos = list(channel.videos)
-            videos.sort(key=lambda x: x.publish_date, reverse=True)  # Sort by date, newest first
-            
-            video_paths = []
-            count = 0
-            
-            for video in videos:
-                if count >= limit:
-                    break
-                
-                # Skip videos before backtest_end_date
-                if backtest_end_date and video.publish_date < backtest_end_date:
-                    print(f"Skipping video from {video.publish_date.strftime('%Y-%m-%d')} (before backtest end date)")
-                    continue
-                
-                print(f"Downloading: {video.title} (Published: {video.publish_date.strftime('%Y-%m-%d')})")
-                video_path = self._download_video(video)
-                if video_path:
-                    video_paths.append(video_path)
-                    count += 1
-                    time.sleep(2)  # Add delay between downloads
-            
-            return video_paths
-        except Exception as e:
-            print(f"Error downloading from channel: {e}")
-            return []
-    
-    def _normalize_channel_url(self, url):
-        """Normalize YouTube channel URL to standard format"""
-        try:
-            # Remove any trailing slashes
-            url = url.rstrip('/')
-            
-            # Handle different URL formats
-            if '/channel/' in url:
-                return url
-            elif '/c/' in url:
-                # Convert /c/ format to /channel/ format
-                channel_name = url.split('/c/')[-1]
-                # First get the channel ID
-                response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
-                if response.status_code == 200:
-                    channel_id_match = re.search(r'channel/([^/]+)', response.text)
-                    if channel_id_match:
-                        return f"https://www.youtube.com/channel/{channel_id_match.group(1)}"
-                    # Try alternative pattern
-                    channel_id_match = re.search(r'data-channel-id="([^"]+)"', response.text)
-                    if channel_id_match:
-                        return f"https://www.youtube.com/channel/{channel_id_match.group(1)}"
-            elif '/user/' in url:
-                # Convert /user/ format to /channel/ format
-                user_name = url.split('/user/')[-1]
-                response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
-                if response.status_code == 200:
-                    channel_id_match = re.search(r'channel/([^/]+)', response.text)
-                    if channel_id_match:
-                        return f"https://www.youtube.com/channel/{channel_id_match.group(1)}"
-                    # Try alternative pattern
-                    channel_id_match = re.search(r'data-channel-id="([^"]+)"', response.text)
-                    if channel_id_match:
-                        return f"https://www.youtube.com/channel/{channel_id_match.group(1)}"
-            elif '@' in url:  # Handle @username format
-                username = url.split('@')[-1]
-                response = requests.get(f"https://www.youtube.com/@{username}", headers={'User-Agent': 'Mozilla/5.0'})
-                if response.status_code == 200:
-                    channel_id_match = re.search(r'channel/([^/]+)', response.text)
-                    if channel_id_match:
-                        return f"https://www.youtube.com/channel/{channel_id_match.group(1)}"
-                    # Try alternative pattern
-                    channel_id_match = re.search(r'data-channel-id="([^"]+)"', response.text)
-                    if channel_id_match:
-                        return f"https://www.youtube.com/channel/{channel_id_match.group(1)}"
-            
-            # If no specific format found, try to get channel ID directly
-            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
-            if response.status_code == 200:
-                channel_id_match = re.search(r'channel/([^/]+)', response.text)
-                if channel_id_match:
-                    return f"https://www.youtube.com/channel/{channel_id_match.group(1)}"
-                # Try alternative pattern
-                channel_id_match = re.search(r'data-channel-id="([^"]+)"', response.text)
-                if channel_id_match:
-                    return f"https://www.youtube.com/channel/{channel_id_match.group(1)}"
-            
-            print(f"Could not normalize channel URL: {url}")
-            return None
-        except Exception as e:
-            print(f"Error normalizing channel URL: {e}")
-            return None
-    
-    def _download_video(self, video):
-        """Download a single YouTube video
-        
-        Args:
-            video (YouTube): YouTube video object
-            
-        Returns:
-            str: Path to downloaded video or None if failed
-        """
-        try:
-            # Get video ID if it's a URL
-            if isinstance(video, str):
-                video_id = self._extract_video_id(video)
-                if not video_id:
-                    print("Invalid video URL")
-                    return None
-                video = self._create_youtube_object(f"https://www.youtube.com/watch?v={video_id}")
-            
-            # Get available streams
-            streams = video.streams.filter(progressive=True, file_extension='mp4')
-            if not streams:
-                print("No suitable streams found")
-                return None
-            
-            # Get the highest resolution stream
-            stream = streams.order_by('resolution').desc().first()
-            if not stream:
-                print("No suitable stream found")
-                return None
-            
-            # Get video date
-            video_date = video.publish_date.strftime("%Y-%m-%d")
-            
-            # Create a safe filename using only alphanumeric characters and underscores
-            safe_title = re.sub(r'[^a-zA-Z0-9]', '_', video.title)
-            safe_title = re.sub(r'_+', '_', safe_title)  # Replace multiple underscores with single
-            safe_title = safe_title.strip('_')  # Remove leading/trailing underscores
-            safe_title = safe_title[:50]  # Limit title length to leave room for date
-            
-            # Create filename with date: YYYY-MM-DD_Title.mp4
-            safe_filename = f"{video_date}_{safe_title}.mp4"
-            
-            output_path = os.path.join(self.output_dir, safe_filename)
-            
-            # Download the video with retry mechanism
-            try:
-                print(f"Downloading stream: {stream.resolution}")
-                self._download_stream(stream, output_path)
-                print(f"Downloaded: {output_path}")
-                return output_path
-            except Exception as e:
-                print(f"Failed to download video after retries: {e}")
-                return None
-            
-        except Exception as e:
-            print(f"Error downloading video: {e}")
-            return None
-    
-    def _extract_video_id(self, url):
-        """Extract video ID from URL"""
-        try:
-            parsed_url = urlparse(url)
-            if parsed_url.hostname == 'youtu.be':
-                return parsed_url.path[1:]
-            if parsed_url.hostname in ('www.youtube.com', 'youtube.com'):
-                if parsed_url.path == '/watch':
-                    return parse_qs(parsed_url.query)['v'][0]
-                if parsed_url.path[:7] == '/embed/':
-                    return parsed_url.path.split('/')[2]
-            return None
-        except Exception as e:
-            print(f"Error extracting video ID: {e}")
-            return None
-    
-    def download_single_video(self, video_url):
-        """Download a single video from URL
-        
-        Args:
-            video_url (str): URL of the YouTube video
-            
-        Returns:
-            str: Path to downloaded video or None if failed
-        """
-        try:
-            # Extract video ID
-            video_id = self._extract_video_id(video_url)
-            if not video_id:
-                print("Invalid video URL")
-                return None
-            
-            # Create YouTube object with retry mechanism
-            try:
-                print("Creating YouTube object")
-                video = self._create_youtube_object(f"https://www.youtube.com/watch?v={video_id}")
-                return self._download_video(video)
-            except Exception as e:
-                print(f"Failed to create YouTube object after retries: {e}")
-                return None
-                
-        except Exception as e:
-            print(f"Error downloading video: {e}")
-            return None
     
     def _extract_audio(self, video_path):
         """Extract audio from video
@@ -536,30 +266,24 @@ class VideoToScript:
             print(f"Error with Whisper transcription: {str(e)}")
             return self._transcribe_with_speech_recognition(audio_path)
     
-    def video_to_script(self, video_path):
+    def video_to_script(self, video_info):
         """Convert video to script
         
         Args:
-            video_path (str): Path to the video file
+            video_info (dict): Dictionary containing video path and metadata
             
         Returns:
             dict: JSON with video info and script
         """
         try:
-            # Extract video info
+            video_path = video_info["path"]
             video_filename = os.path.basename(video_path)
             video_name = os.path.splitext(video_filename)[0]
             
-            # Try to get video date from filename first
-            video_date = self._get_video_date_from_filename(video_filename)
-            
-            # Convert video to audio
+            # Convert video to audio and transcribe
+            print("No captions available, using audio transcription")
             audio_path = self._extract_audio(video_path)
-            
-            # Convert audio to text using Whisper
             script = self._transcribe_with_whisper(audio_path)
-            
-            # Clean up temporary audio file
             if os.path.exists(audio_path):
                 os.remove(audio_path)
             
@@ -569,7 +293,10 @@ class VideoToScript:
                 "video_path": video_path,
                 "script": script,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "video_date": video_date  # Add video date if found
+                "video_date": video_info["date"],
+                "video_title": video_info["title"],
+                "video_id": video_info["video_id"],
+                "has_captions": video_info.get("has_captions", False)
             }
             
             return result
@@ -581,25 +308,6 @@ class VideoToScript:
                 "script": f"Error: {str(e)}",
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
-    
-    def process_channel(self, channel_url, limit=5):
-        """Process videos from a channel
-        
-        Args:
-            channel_url (str): URL of the YouTube channel
-            limit (int): Maximum number of videos to process
-            
-        Returns:
-            list: List of results with video info and scripts
-        """
-        video_paths = self.download_from_channel(channel_url, limit)
-        results = []
-        
-        for video_path in video_paths:
-            result = self.video_to_script(video_path)
-            results.append(result)
-        
-        return results
     
     def save_results(self, results, output_file="data/video_scripts.json"):
         """Save results to a JSON file
@@ -619,18 +327,201 @@ class VideoToScript:
         print(f"Results saved to {output_file}")
         return output_file
 
+    def process_video(self, downloader, analyzer, video_info):
+        """Process a single video: download, transcribe, and analyze"""
+        try:
+            # Download video and get captions if available
+            result = downloader._download_video(video_info['url'])
+            if not result:
+                print("✗ Download failed, skipping analysis")
+                return None
+                
+            print("✓ Download successful")
+            
+            # Check if we already have a transcript from captions
+            if result.get("transcript"):
+                print("✓ Using available captions")
+                transcript = result["transcript"]
+            else:
+                print("No captions available, starting audio transcription...")
+                video_path = result['path']
+                audio_path = video_path.replace('.mp4', '.wav')
+                
+                # Convert video to audio with suppressed output
+                try:
+                    subprocess.run([
+                        'ffmpeg', '-i', video_path,
+                        '-vn',
+                        '-acodec', 'pcm_s16le',
+                        '-ar', '44100',
+                        '-ac', '2',
+                        audio_path
+                    ], check=True, capture_output=True)
+                    print("✓ Audio extraction successful")
+                except subprocess.CalledProcessError as e:
+                    print(f"✗ Error extracting audio: {e}")
+                    return None
+                except FileNotFoundError:
+                    print("✗ ffmpeg not found. Please install ffmpeg to use transcription.")
+                    return None
+                
+                # Initialize speech recognizer
+                recognizer = sr.Recognizer()
+                
+                # Transcribe audio with improved error handling
+                try:
+                    with sr.AudioFile(audio_path) as source:
+                        print("Processing audio...")
+                        # Adjust for ambient noise
+                        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                        audio = recognizer.record(source)
+                        print("Transcribing...")
+                        
+                        # Try multiple speech recognition services with better error handling
+                        transcript = None
+                        errors = []
+                        
+                        # Try Google Speech Recognition first
+                        try:
+                            transcript = recognizer.recognize_google(audio, language="en-US")
+                            print("✓ Google Speech Recognition successful")
+                        except sr.UnknownValueError:
+                            errors.append("Google Speech Recognition could not understand audio")
+                        except sr.RequestError as e:
+                            errors.append(f"Google Speech Recognition request failed: {e}")
+                        
+                        # If Google fails, try Sphinx
+                        if not transcript:
+                            try:
+                                transcript = recognizer.recognize_sphinx(audio)
+                                print("✓ Sphinx Speech Recognition successful")
+                            except Exception as e:
+                                errors.append(f"Sphinx Speech Recognition failed: {e}")
+                        
+                        # If both fail, try Whisper
+                        if not transcript:
+                            try:
+                                transcript = self._transcribe_with_whisper(audio_path)
+                                if transcript:
+                                    print("✓ Whisper transcription successful")
+                            except Exception as e:
+                                errors.append(f"Whisper transcription failed: {e}")
+                        
+                        if not transcript:
+                            print("✗ All transcription methods failed:")
+                            for error in errors:
+                                print(f"  - {error}")
+                            return None
+                        
+                        print("✓ Transcription successful")
+                        
+                        # Clean up audio file
+                        try:
+                            os.remove(audio_path)
+                            print("Cleaned up audio file")
+                        except Exception as e:
+                            print(f"Error cleaning up audio file: {e}")
+                
+                except Exception as e:
+                    print(f"✗ Error during transcription: {e}")
+                    return None
+            
+            # Save transcription to JSON
+            transcript_data = {
+                "video_id": video_info['video_id'],
+                "title": video_info['title'],
+                "date": video_info['date'],
+                "transcript": transcript,
+                "source": result.get("transcript_source", "audio_transcription"),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # Save to transcripts directory
+            os.makedirs("data/transcripts", exist_ok=True)
+            transcript_file = f"data/transcripts/{video_info['video_id']}.json"
+            with open(transcript_file, 'w', encoding='utf-8') as f:
+                json.dump(transcript_data, f, indent=2, ensure_ascii=False)
+            print(f"✓ Transcription saved to: {transcript_file}")
+            
+            # Preprocess transcript
+            print("Preprocessing transcript...")
+            processed_transcript = analyzer.preprocess_transcript(
+                transcript,
+                video_info['title'],
+                video_info['date']
+            )
+            
+            # Analyze transcript
+            print("Analyzing transcript...")
+            analysis = analyzer.analyze_transcript(
+                processed_transcript,
+                video_info['title'],
+                video_info['date']
+            )
+            
+            # Combine results
+            result.update({
+                "transcript": transcript,
+                "processed_transcript": processed_transcript,
+                "analysis": analysis,
+                "transcript_source": result.get("transcript_source", "audio_transcription")
+            })
+            
+            return result
+                
+        except Exception as e:
+            print(f"✗ Error processing video: {str(e)}")
+            return None
+
+    def save_progress(self, progress_file, processed_videos, processed_results=None):
+        """Save progress to file
+        
+        Args:
+            progress_file (str): Path to progress file
+            processed_videos (list): List of processed video info dictionaries
+            processed_results (list, optional): List of processed results
+        """
+        try:
+            progress_data = {
+                "videos": processed_videos,
+                "results": processed_results or []
+            }
+            with open(progress_file, "w", encoding="utf-8") as f:
+                json.dump(progress_data, f, indent=2, ensure_ascii=False)
+            print(f"Progress saved to {progress_file}")
+        except Exception as e:
+            print(f"Error saving progress: {e}")
+
+    def load_progress(self, progress_file):
+        """Load progress from file
+        
+        Args:
+            progress_file (str): Path to progress file
+            
+        Returns:
+            tuple: (processed_videos, processed_results)
+        """
+        try:
+            if os.path.exists(progress_file):
+                with open(progress_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data.get("videos", []), data.get("results", [])
+            return [], []
+        except Exception as e:
+            print(f"Error loading progress: {e}")
+            return [], []
+
 # Example usage
 if __name__ == "__main__":
     converter = VideoToScript()
     
-    # Example 1: Download and process a single video
-    video_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-    video_path = converter.download_single_video(video_url)
-    if video_path:
-        result = converter.video_to_script(video_path)
-        print(json.dumps(result, indent=2))
-    
-    # Example 2: Process videos from a channel
-    # channel_url = "https://www.youtube.com/c/TradeBrigade"
-    # results = converter.process_channel(channel_url, limit=2)
-    # converter.save_results(results)
+    # Example: Process a video file
+    video_info = {
+        "path": "path/to/your/video.mp4",
+        "date": "2024-01-01",
+        "title": "Example Video",
+        "video_id": "example123",
+        "has_captions": False
+    }
+    result = converter.video_to_script(video_info)
+    print(json.dumps(result, indent=2))

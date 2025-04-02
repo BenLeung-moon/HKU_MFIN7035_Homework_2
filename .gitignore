@@ -1,8 +1,6 @@
 # Ignore data files
-data/credentials.txt
-data/apkwan/class_pw.txt
+data/
 activate.bat
-setup_ffmpeg.py
 data/perplexity_api_key
 database.py
 data/videos/
@@ -10,6 +8,8 @@ data/results/
 tools/
 models/
 playground.ipynb
+test_downloader.py
+test_transcription.py
 
 # Ignore virtual environment
 venv/
