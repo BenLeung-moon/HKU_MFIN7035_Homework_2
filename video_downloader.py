@@ -7,12 +7,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import re
 from urllib.parse import urlparse, parse_qs
 import multiprocessing
-from functools import partial
 from tqdm import tqdm
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 
@@ -145,6 +142,57 @@ class VideoDownloader:
             print(f"Error filtering videos by date: {e}")
             return []
     
+    def _filter_videos_by_frequency(self, videos, videos_per_week=None):
+        """Filter videos to limit how many are collected per week
+        
+        Args:
+            videos (list): List of video dictionaries
+            videos_per_week (int): Maximum number of videos to keep per week
+            
+        Returns:
+            list: Filtered list of videos
+        """
+        if not videos_per_week or videos_per_week <= 0:
+            return videos  # Return all videos if no limit specified
+            
+        try:
+            # Convert to DataFrame for easier manipulation
+            df = pd.DataFrame(videos)
+            if df.empty:
+                return []
+                
+            # Ensure date column is datetime
+            df['date'] = pd.to_datetime(df['date'])
+            
+            # Add week column (year and week number)
+            df['year_week'] = df['date'].apply(lambda x: f"{x.isocalendar()[0]}_{x.isocalendar()[1]}")
+            
+            # Sort by date descending
+            df = df.sort_values('date', ascending=False)
+            
+            # Group by week and select top N videos per week
+            result = []
+            for week, group in df.groupby('year_week'):
+                week_videos = group.head(videos_per_week).to_dict('records')
+                result.extend(week_videos)
+                
+            # Sort result by date
+            result.sort(key=lambda x: x['date'], reverse=True)
+            
+            # Convert Timestamp objects to strings and remove the year_week column
+            for video in result:
+                if 'year_week' in video:
+                    video.pop('year_week')
+                # Convert Timestamp to string to make it JSON serializable
+                if isinstance(video.get('date'), pd.Timestamp):
+                    video['date'] = video['date'].strftime("%Y-%m-%d")
+                
+            print(f"Filtered from {len(videos)} videos to {len(result)} videos based on frequency limit of {videos_per_week} per week")
+            return result
+        except Exception as e:
+            print(f"Error filtering videos by frequency: {e}")
+            return videos  # Return original list on error
+
     def _download_video_parallel(self, video_info):
         """Download a single video (for parallel processing)"""
         try:
@@ -281,7 +329,8 @@ class VideoDownloader:
                 "date": video.publish_date.strftime("%Y-%m-%d") if video.publish_date else None,
                 "transcript": transcript,
                 "source": "youtube_captions",
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "url": f"https://www.youtube.com/watch?v={video.video_id}"
             }
             
             # Save to transcripts directory
@@ -296,8 +345,8 @@ class VideoDownloader:
         except Exception as e:
             return False, f"Error downloading captions: {str(e)}"
 
-    def _download_video(self, video):
-        """Download a single YouTube video"""
+    def _download_video(self, video, download_video=True):
+        """Download a single YouTube video or just captions based on download_video flag"""
         try:
             if isinstance(video, str):
                 video_id = self._extract_video_id(video)
@@ -313,6 +362,7 @@ class VideoDownloader:
                     video_date = video_date.replace(tzinfo=None)
                 video_title = video.title
                 video_id = video.video_id
+                video_url = f"https://www.youtube.com/watch?v={video_id}"
                 
                 if not video_date or not video_title or not video_id:
                     print("Missing required video metadata")
@@ -331,36 +381,43 @@ class VideoDownloader:
                 safe_filename = f"{video_date.strftime('%Y-%m-%d')}_{safe_title}.mp4"
                 output_path = os.path.join(self.output_dir, safe_filename)
                 
-                # Get best quality stream
-                streams = video.streams.filter(progressive=True, file_extension='mp4')
-                if not streams:
-                    print("No suitable streams found")
-                    return None
-                
-                stream = streams.order_by('resolution').desc().first()
-                if not stream:
-                    print("No suitable stream found")
-                    return None
-                
-                # Download the video
-                print(f"Downloading stream: {stream.resolution}")
-                self._download_stream(stream, output_path)
-                print(f"Downloaded: {output_path}")
-                
+                # Initialize result with metadata
                 result = {
-                    "path": output_path,
                     "date": video_date.strftime("%Y-%m-%d"),
                     "title": video_title,
                     "video_id": video_id,
                     "has_captions": has_captions,
                     "safe_title": safe_title,
-                    "url": f"https://www.youtube.com/watch?v={video_id}"
+                    "url": video_url
                 }
                 
                 # Add caption information if available
                 if caption_success:
                     result["transcript"] = caption_result
                     result["transcript_source"] = "youtube_captions"
+                
+                # Only download the actual video if download_video is True
+                if download_video:
+                    # Get best quality stream
+                    streams = video.streams.filter(progressive=True, file_extension='mp4')
+                    if not streams:
+                        print("No suitable streams found")
+                        if not caption_success:
+                            return None
+                    else:
+                        stream = streams.order_by('resolution').desc().first()
+                        if not stream:
+                            print("No suitable stream found")
+                            if not caption_success:
+                                return None
+                        
+                        # Download the video
+                        print(f"Downloading stream: {stream.resolution}")
+                        self._download_stream(stream, output_path)
+                        print(f"Downloaded: {output_path}")
+                        result["path"] = output_path
+                else:
+                    print(f"Skipping video download for: {video_title}")
                 
                 return result
                 
@@ -458,13 +515,15 @@ class VideoDownloader:
         plt.savefig(os.path.join(self.viz_dir, f'{channel_name}_filtering_stats.png'))
         plt.close()
 
-    def get_channel_videos(self, channel_url, backtest_start_date=None, backtest_end_date=None):
+    def get_channel_videos(self, channel_url, backtest_start_date=None, backtest_end_date=None, videos_per_week=None):
         """Get list of videos from channel within date range using efficient caching"""
         try:
             print(f"\n=== Fetching Channel Videos ===")
             print(f"Channel URL: {channel_url}")
             print(f"Backtest start date: {backtest_start_date}")
             print(f"Backtest end date: {backtest_end_date}")
+            if videos_per_week:
+                print(f"Videos per week: {videos_per_week}")
             
             # Convert dates to datetime if provided
             if backtest_start_date:
@@ -511,6 +570,10 @@ class VideoDownloader:
                     filtered_videos.append(video)
             
             print(f"Found {len(filtered_videos)} videos in date range")
+            
+            # Apply frequency filter if specified
+            if videos_per_week and videos_per_week > 0:
+                filtered_videos = self._filter_videos_by_frequency(filtered_videos, videos_per_week)
             
             # Save filtered cache temporarily
             if filtered_videos:

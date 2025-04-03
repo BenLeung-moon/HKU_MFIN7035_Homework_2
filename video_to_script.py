@@ -6,7 +6,6 @@ from pydub import AudioSegment
 import tempfile
 import time
 import re
-from tenacity import retry, stop_after_attempt, wait_exponential
 from faster_whisper import WhisperModel
 import torch
 import platform
@@ -14,8 +13,13 @@ import multiprocessing
 import subprocess
 
 class VideoToScript:
-    def __init__(self, output_dir="data/videos"):
-        """Initialize the VideoToScript class with output directory"""
+    def __init__(self, output_dir="data/videos", load_model=True):
+        """Initialize the VideoToScript class with output directory
+        
+        Args:
+            output_dir (str): Directory for output files
+            load_model (bool): Whether to load the transcription model on initialization
+        """
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         
@@ -26,84 +30,16 @@ class VideoToScript:
         self.num_cores = multiprocessing.cpu_count()
         print(f"Number of CPU cores available: {self.num_cores}")
         
-        # Check for GPU availability and optimize settings
-        self.device = "cuda" if torch.cuda.is_available() else "mps" if self._is_mac_with_metal() else "cpu"
+        # Initialize model-related attributes
+        self.device = None
+        self.compute_type = None
+        self.model_size = None
+        self.model = None
         
-        if self.device == "cuda":
-            # Get GPU information
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
-            print(f"Using CUDA GPU: {gpu_name} with {gpu_memory:.1f}GB memory")
-            
-            # Optimize compute type and model size based on GPU memory
-            if gpu_memory >= 16:  # High-end GPU
-                self.compute_type = "float16"
-                self.model_size = "large"  # Use larger model for high-end GPUs
-            else:  # Mid-range GPU
-                self.compute_type = "int8_float16"
-                self.model_size = "medium"  # Use medium model for mid-range GPUs
-            
-            # Verify CUDA is working
-            try:
-                test_tensor = torch.zeros(1).cuda()
-                print("CUDA initialization successful")
-            except Exception as e:
-                print(f"CUDA initialization failed: {e}")
-                print("Falling back to CPU")
-                self.device = "cpu"
-                self.compute_type = "int8"
-                self.model_size = "base"
-        elif self.device == "mps":
-            print("Using Apple Metal GPU acceleration")
-            self.compute_type = "float16"  # Metal works best with float16
-            self.model_size = "medium"  # Use medium model for Metal GPU
-            
-            # Verify MPS is working
-            try:
-                test_tensor = torch.zeros(1).to("mps")
-                print("MPS initialization successful")
-            except Exception as e:
-                print(f"MPS initialization failed: {e}")
-                print("Falling back to CPU")
-                self.device = "cpu"
-                self.compute_type = "int8"
-                self.model_size = "base"
-        else:
-            self.compute_type = "int8"
-            self.model_size = "base"  # Use base model for CPU
-            print("Using CPU for transcription")
+        # Only load the model if explicitly requested
+        if load_model:
+            self._load_transcription_model()
         
-        print(f"Using device: {self.device}")
-        print(f"Compute type: {self.compute_type}")
-        print(f"Model size: {self.model_size}")
-        
-        # Initialize whisper model with optimized settings
-        print("Loading Whisper model...")
-        try:
-            self.model = WhisperModel(
-                self.model_size,  # Use model size based on device
-                device=self.device,
-                compute_type=self.compute_type,
-                download_root="models",  # Save models to a local directory
-                num_workers=1 if self.device in ["cuda", "mps"] else self.num_cores,  # Use 1 worker for GPU, all cores for CPU
-                cpu_threads=1 if self.device in ["cuda", "mps"] else self.num_cores  # Use 1 thread for GPU, all cores for CPU
-            )
-            print("Whisper model loaded successfully")
-        except Exception as e:
-            print(f"Error loading Whisper model: {e}")
-            print("Falling back to CPU with base model")
-            self.device = "cpu"
-            self.compute_type = "int8"
-            self.model_size = "base"
-            self.model = WhisperModel(
-                "base",
-                device="cpu",
-                compute_type="int8",
-                download_root="models",
-                num_workers=self.num_cores,
-                cpu_threads=self.num_cores
-            )
-    
     def _check_ffmpeg(self):
         """Check if ffmpeg is installed and accessible"""
         try:
@@ -225,6 +161,90 @@ class VideoToScript:
             print(f"Error splitting audio: {e}")
             raise
     
+    def _load_transcription_model(self):
+        """Load the transcription model with optimized settings"""
+        if self.model is not None:
+            print("Transcription model already loaded")
+            return
+            
+        # Check for GPU availability and optimize settings
+        self.device = "cuda" if torch.cuda.is_available() else "mps" if self._is_mac_with_metal() else "cpu"
+        
+        if self.device == "cuda":
+            # Get GPU information
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
+            print(f"Using CUDA GPU: {gpu_name} with {gpu_memory:.1f}GB memory")
+            
+            # Optimize compute type and model size based on GPU memory
+            if gpu_memory >= 16:  # High-end GPU
+                self.compute_type = "float16"
+                self.model_size = "large"  # Use larger model for high-end GPUs
+            else:  # Mid-range GPU
+                self.compute_type = "int8_float16"
+                self.model_size = "medium"  # Use medium model for mid-range GPUs
+            
+            # Verify CUDA is working
+            try:
+                test_tensor = torch.zeros(1).cuda()
+                print("CUDA initialization successful")
+            except Exception as e:
+                print(f"CUDA initialization failed: {e}")
+                print("Falling back to CPU")
+                self.device = "cpu"
+                self.compute_type = "int8"
+                self.model_size = "base"
+        elif self.device == "mps":
+            print("Using Apple Metal GPU acceleration")
+            self.compute_type = "float16"  # Metal works best with float16
+            self.model_size = "medium"  # Use medium model for Metal GPU
+            
+            # Verify MPS is working
+            try:
+                test_tensor = torch.zeros(1).to("mps")
+                print("MPS initialization successful")
+            except Exception as e:
+                print(f"MPS initialization failed: {e}")
+                print("Falling back to CPU")
+                self.device = "cpu"
+                self.compute_type = "int8"
+                self.model_size = "base"
+        else:
+            self.compute_type = "int8"
+            self.model_size = "base"  # Use base model for CPU
+            print("Using CPU for transcription")
+        
+        print(f"Using device: {self.device}")
+        print(f"Compute type: {self.compute_type}")
+        print(f"Model size: {self.model_size}")
+        
+        # Initialize whisper model with optimized settings
+        print("Loading Whisper model...")
+        try:
+            self.model = WhisperModel(
+                self.model_size,  # Use model size based on device
+                device=self.device,
+                compute_type=self.compute_type,
+                download_root="models",  # Save models to a local directory
+                num_workers=1 if self.device in ["cuda", "mps"] else self.num_cores,  # Use 1 worker for GPU, all cores for CPU
+                cpu_threads=1 if self.device in ["cuda", "mps"] else self.num_cores  # Use 1 thread for GPU, all cores for CPU
+            )
+            print("Whisper model loaded successfully")
+        except Exception as e:
+            print(f"Error loading Whisper model: {e}")
+            print("Falling back to CPU with base model")
+            self.device = "cpu"
+            self.compute_type = "int8"
+            self.model_size = "base"
+            self.model = WhisperModel(
+                "base",
+                device="cpu",
+                compute_type="int8",
+                download_root="models",
+                num_workers=self.num_cores,
+                cpu_threads=self.num_cores
+            )
+    
     def _transcribe_with_whisper(self, audio_path):
         """Transcribe audio using Whisper with GPU acceleration
         
@@ -237,6 +257,11 @@ class VideoToScript:
         try:
             print(f"Transcribing audio with Whisper: {audio_path}")
             
+            # Ensure model is loaded
+            if self.model is None:
+                print("Loading transcription model on demand")
+                self._load_transcription_model()
+                
             # Optimize transcription parameters based on device
             if self.device in ["cuda", "mps"]:
                 segments, _ = self.model.transcribe(
@@ -327,22 +352,29 @@ class VideoToScript:
         print(f"Results saved to {output_file}")
         return output_file
 
-    def process_video(self, downloader, analyzer, video_info):
+    def process_video(self, downloader, analyzer, video_info, download_video=True):
         """Process a single video: download, transcribe, and analyze"""
         try:
-            # Download video and get captions if available
-            result = downloader._download_video(video_info['url'])
+            # Download video and get captions if available, respecting download_video flag
+            result = downloader._download_video(video_info['url'], download_video=download_video)
             if not result:
                 print("✗ Download failed, skipping analysis")
                 return None
                 
-            print("✓ Download successful")
+            if download_video:
+                print("✓ Download successful")
+            else:
+                print("✓ Metadata and captions retrieval successful")
             
             # Check if we already have a transcript from captions
             if result.get("transcript"):
                 print("✓ Using available captions")
                 transcript = result["transcript"]
             else:
+                if not download_video:
+                    print("✗ No captions available and video download is disabled. Cannot transcribe audio.")
+                    return None
+                    
                 print("No captions available, starting audio transcription...")
                 video_path = result['path']
                 audio_path = video_path.replace('.mp4', '.wav')
@@ -433,7 +465,8 @@ class VideoToScript:
                 "date": video_info['date'],
                 "transcript": transcript,
                 "source": result.get("transcript_source", "audio_transcription"),
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "url": video_info['url']
             }
             
             # Save to transcripts directory
